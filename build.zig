@@ -7,8 +7,8 @@ const zig_version = std.SemanticVersion{
     .patch = 1,
 };
 
+// use zig 0.15.1
 comptime {
-    // Compare versions while allowing different pre/patch metadata.
     const zig_version_eq = zig_version.major == builtin.zig_version.major and
         zig_version.minor == builtin.zig_version.minor and
         (zig_version.patch == builtin.zig_version.patch);
