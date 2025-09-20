@@ -25,9 +25,9 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "l1ne_poc",
+        .name = "l1ne",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/l1ne/main.zig"),
             .target = target,
             .optimize = optimize,
         }),
