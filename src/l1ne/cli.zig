@@ -26,6 +26,48 @@ const orchestrator_port = 42069; // Orchestrator control plane port
 const max_nodes = 4; // POC: Maximum 4 service instances (like pods) on same server
 // Services and ports come from CLI: --service=name --nodes=port1,port2,port3
 
+// Generic validation configuration
+const ValidationConfig = struct {
+    flag: []const u8,
+    min: ?u64 = null,
+    max: ?u64 = null,
+    alignment: ?u64 = null,
+    required: bool = false,
+};
+
+// Generic validation function to reduce repetition
+fn validate_range(value: anytype, config: ValidationConfig) @TypeOf(value) {
+    const T = @TypeOf(value);
+    const numeric_value = if (T == ByteSize) value.bytes() else value;
+
+    if (config.min) |min| {
+        if (numeric_value < min) {
+            fatal("{s}: value {} is below minimum: {}", .{ config.flag, numeric_value, min });
+        }
+    }
+
+    if (config.max) |max| {
+        if (numeric_value > max) {
+            fatal("{s}: value {} exceeds maximum: {}", .{ config.flag, numeric_value, max });
+        }
+    }
+
+    if (config.alignment) |alignment| {
+        if (numeric_value % alignment != 0) {
+            fatal("{s}: value must be a multiple of {}", .{ config.flag, alignment });
+        }
+    }
+
+    return value;
+}
+
+fn validate_percentage(value: u8, flag: []const u8) u8 {
+    if (value == 0 or value > 100) {
+        fatal("{s} must be between 1 and 100", .{flag});
+    }
+    return value;
+}
+
 const CLIArgs = union(enum) {
     const Start = struct {
         // Required: service configuration
@@ -330,139 +372,133 @@ fn parse_cli_args(args_iterator: anytype, allocator: std.mem.Allocator) CLIArgs 
     }
 }
 
-// Deploy merged into Start - no longer needed
-// fn parse_deploy_args(args_iterator: anytype) CLIArgs.Deploy { ... }
-
 fn parse_status_args(args_iterator: anytype) CLIArgs.Status {
-    var result = CLIArgs.Status{};
+    var parser = GenericArgParser(CLIArgs.Status).init();
 
     while (args_iterator.next()) |arg| {
-        if (std.mem.startsWith(u8, arg, "--node=")) {
-            result.node = arg["--node=".len..];
-        }
+        if (parser.parseFlag(arg, "--node=", "node")) continue;
+        // Additional status-specific flags can be added here
     }
 
-    return result;
+    return parser.result;
 }
 
 fn parse_wal_args(args_iterator: anytype) CLIArgs.WAL {
-    var result = CLIArgs.WAL{
-        .path = "",
-    };
+    var parser = GenericArgParser(CLIArgs.WAL).init();
 
     while (args_iterator.next()) |arg| {
-        if (std.mem.startsWith(u8, arg, "--node=")) {
-            result.node = arg["--node=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--slot=")) {
-            result.slot = std.fmt.parseInt(usize, arg["--slot=".len..], 10) catch {
-                fatal("Invalid slot: {s}", .{arg});
-            };
-        } else if (std.mem.startsWith(u8, arg, "--lines=")) {
-            result.lines = std.fmt.parseInt(u32, arg["--lines=".len..], 10) catch {
-                fatal("Invalid lines: {s}", .{arg});
-            };
-        } else if (std.mem.eql(u8, arg, "--follow") or std.mem.eql(u8, arg, "-f")) {
-            result.follow = true;
+        if (parser.parseFlag(arg, "--node=", "node")) continue;
+        if (parser.parseFlag(arg, "--slot=", "slot")) continue;
+        if (parser.parseFlag(arg, "--lines=", "lines")) continue;
+
+        if (std.mem.eql(u8, arg, "--follow") or std.mem.eql(u8, arg, "-f")) {
+            parser.result.follow = true;
         } else if (!std.mem.startsWith(u8, arg, "--")) {
-            result.path = arg;
+            parser.result.path = arg;
         }
     }
 
-    if (result.path.len == 0) fatal("WAL path is required", .{});
+    if (parser.result.path.len == 0) fatal("WAL path is required", .{});
 
-    return result;
+    return parser.result;
 }
 
-// Format removed - no longer needed for orchestrator
-// fn parse_format_args(args_iterator: anytype) CLIArgs.Format {
-//     var result = CLIArgs.Format{
-//         .replica_count = 0,
-//         .positional = .{ .path = "" },
-//     };
-//
-//     while (args_iterator.next()) |arg| {
-//         if (std.mem.startsWith(u8, arg, "--cluster=")) {
-//             const value_str = arg["--cluster=".len..];
-//             result.cluster = std.fmt.parseInt(u128, value_str, 10) catch {
-//                 fatal("Invalid cluster ID: {s}", .{value_str});
-//             };
-//         } else if (std.mem.startsWith(u8, arg, "--replica=")) {
-//             const value_str = arg["--replica=".len..];
-//             result.replica = std.fmt.parseInt(u8, value_str, 10) catch {
-//                 fatal("Invalid replica index: {s}", .{value_str});
-//             };
-//         } else if (std.mem.startsWith(u8, arg, "--standby=")) {
-//             const value_str = arg["--standby=".len..];
-//             result.standby = std.fmt.parseInt(u8, value_str, 10) catch {
-//                 fatal("Invalid standby index: {s}", .{value_str});
-//             };
-//         } else if (std.mem.startsWith(u8, arg, "--replica-count=")) {
-//             const value_str = arg["--replica-count=".len..];
-//             result.replica_count = std.fmt.parseInt(u8, value_str, 10) catch {
-//                 fatal("Invalid replica count: {s}", .{value_str});
-//             };
-//         } else if (std.mem.eql(u8, arg, "--development")) {
-//             result.development = true;
-//         } else if (std.mem.eql(u8, arg, "--log-debug")) {
-//             result.log_debug = true;
-//         } else if (!std.mem.startsWith(u8, arg, "--")) {
-//             result.positional.path = arg;
-//         }
-//     }
-//
-//     if (result.positional.path.len == 0) {
-//         fatal("Missing required data file path", .{});
-//     }
-//
-//     return result;
-// }
+fn GenericArgParser(comptime T: type) type {
+    return struct {
+        result: T,
+
+        const Self = @This();
+
+        pub fn init() Self {
+            var result: T = undefined;
+
+            // Initialize all fields with their defaults
+            inline for (std.meta.fields(T)) |field| {
+                if (field.default_value_ptr) |default_ptr| {
+                    const default_value = @as(*const field.type, @ptrCast(@alignCast(default_ptr))).*;
+                    @field(result, field.name) = default_value;
+                } else {
+                    // For fields without defaults, initialize based on type
+                    @field(result, field.name) = switch (@typeInfo(field.type)) {
+                        .optional => null,
+                        .bool => false,
+                        .int => 0,
+                        .pointer => |ptr| if (ptr.size == .slice) "" else undefined,
+                        else => undefined,
+                    };
+                }
+            }
+
+            return .{ .result = result };
+        }
+
+        pub fn parseFlag(self: *Self, arg: []const u8, comptime prefix: []const u8, comptime field_name: []const u8) bool {
+            if (std.mem.startsWith(u8, arg, prefix)) {
+                const field = std.meta.fieldInfo(T, @field(std.meta.FieldEnum(T), field_name));
+                const value_str = arg[prefix.len..];
+
+                switch (@typeInfo(field.type)) {
+                    .optional => |opt| {
+                        switch (@typeInfo(opt.child)) {
+                            .int => |_| {
+                                @field(self.result, field_name) = std.fmt.parseInt(opt.child, value_str, 10) catch {
+                                    fatal("Invalid {s}: {s}", .{ field_name, value_str });
+                                };
+                            },
+                            .pointer => |ptr| if (ptr.size == .slice) {
+                                @field(self.result, field_name) = value_str;
+                            } else unreachable,
+                            else => {
+                                if (opt.child == ByteSize) {
+                                    @field(self.result, field_name) = parse_byte_size(value_str);
+                                }
+                            },
+                        }
+                    },
+                    .int => |_| {
+                        @field(self.result, field_name) = std.fmt.parseInt(field.type, value_str, 10) catch {
+                            fatal("Invalid {s}: {s}", .{ field_name, value_str });
+                        };
+                    },
+                    .pointer => |ptr| if (ptr.size == .slice) {
+                        @field(self.result, field_name) = value_str;
+                    } else unreachable,
+                    else => unreachable,
+                }
+                return true;
+            }
+            return false;
+        }
+    };
+}
 
 fn parse_start_args(args_iterator: anytype) CLIArgs.Start {
-    var result = CLIArgs.Start{
-        .service = "",
-        .pid_addresses = "",
-        .positional = .{ .path = "" },
-    };
+    var parser = GenericArgParser(CLIArgs.Start).init();
 
     while (args_iterator.next()) |arg| {
-        if (std.mem.startsWith(u8, arg, "--service=")) {
-            result.service = arg["--service=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--nodes=") or std.mem.startsWith(u8, arg, "--pid-addresses=")) {
+        // Use comptime-generated parsing for common patterns
+        if (parser.parseFlag(arg, "--service=", "service")) continue;
+        if (parser.parseFlag(arg, "--cache-size=", "cache_size")) continue;
+        if (parser.parseFlag(arg, "--limit-storage=", "limit_storage")) continue;
+        if (parser.parseFlag(arg, "--limit-request=", "limit_request")) continue;
+        if (parser.parseFlag(arg, "--limit-pipeline-requests=", "limit_pipeline_requests")) continue;
+        if (parser.parseFlag(arg, "--timeout-prepare-ms=", "timeout_prepare_ms")) continue;
+
+        // Handle special cases that need custom logic
+        if (std.mem.startsWith(u8, arg, "--nodes=") or std.mem.startsWith(u8, arg, "--pid-addresses=")) {
             const prefix_len = if (std.mem.startsWith(u8, arg, "--nodes=")) "--nodes=".len else "--pid-addresses=".len;
-            result.pid_addresses = arg[prefix_len..];
+            parser.result.pid_addresses = arg[prefix_len..];
         } else if (std.mem.startsWith(u8, arg, "--address=") or std.mem.startsWith(u8, arg, "--bind=")) {
             const prefix_len = if (std.mem.startsWith(u8, arg, "--bind=")) "--bind=".len else "--address=".len;
-            result.address = arg[prefix_len..];
-        } else if (std.mem.startsWith(u8, arg, "--cache-size=")) {
-            result.cache_size = parse_byte_size(arg["--cache-size=".len..]);
-        } else if (std.mem.startsWith(u8, arg, "--limit-storage=")) {
-            result.limit_storage = parse_byte_size(arg["--limit-storage=".len..]);
-        } else if (std.mem.startsWith(u8, arg, "--limit-request=")) {
-            result.limit_request = parse_byte_size(arg["--limit-request=".len..]);
-        } else if (std.mem.startsWith(u8, arg, "--limit-pipeline-requests=")) {
-            const value_str = arg["--limit-pipeline-requests=".len..];
-            result.limit_pipeline_requests = std.fmt.parseInt(u32, value_str, 10) catch {
-                fatal("Invalid pipeline requests limit: {s}", .{value_str});
-            };
-        } else if (std.mem.startsWith(u8, arg, "--timeout-prepare-ms=")) {
-            const value_str = arg["--timeout-prepare-ms=".len..];
-            result.timeout_prepare_ms = std.fmt.parseInt(u64, value_str, 10) catch {
-                fatal("Invalid timeout: {s}", .{value_str});
-            };
+            parser.result.address = arg[prefix_len..];
         } else if (std.mem.eql(u8, arg, "--logger")) {
-            result.logger = true;
+            parser.result.logger = true;
         } else if (std.mem.eql(u8, arg, "--sre")) {
-            result.sre = true;
-        } else if (std.mem.startsWith(u8, arg, "--replica=")) {
-            const value_str = arg["--replica=".len..];
-            result.replica = std.fmt.parseInt(u8, value_str, 10) catch {
-                fatal("Invalid replica: {s}", .{value_str});
-            };
-        } else if (std.mem.startsWith(u8, arg, "--max-replica=")) {
-            const value_str = arg["--max-replica=".len..];
-            result.max_replica = std.fmt.parseInt(u8, value_str, 10) catch {
-                fatal("Invalid max-replica: {s}", .{value_str});
-            };
+            parser.result.sre = true;
+        } else if (parser.parseFlag(arg, "--replica=", "replica")) {
+            // Handled by parseFlag
+        } else if (parser.parseFlag(arg, "--max-replica=", "max_replica")) {
+            // Handled by parseFlag
         } else if (std.mem.startsWith(u8, arg, "--mem-max=") or std.mem.startsWith(u8, arg, "--mem-percent=")) {
             const is_percent = std.mem.startsWith(u8, arg, "--mem-percent=");
             const prefix_len = if (is_percent) "--mem-percent=".len else "--mem-max=".len;
@@ -472,9 +508,9 @@ fn parse_start_args(args_iterator: anytype) CLIArgs.Start {
                 fatal("Invalid {s}: {s}", .{ field_name, value_str });
             };
             if (is_percent) {
-                result.mem_percent = val;
+                parser.result.mem_percent = val;
             } else {
-                result.mem_max = val;
+                parser.result.mem_max = val;
             }
         } else if (std.mem.startsWith(u8, arg, "--cpu-max=") or std.mem.startsWith(u8, arg, "--cpu-percent=")) {
             const is_percent = std.mem.startsWith(u8, arg, "--cpu-percent=");
@@ -485,80 +521,67 @@ fn parse_start_args(args_iterator: anytype) CLIArgs.Start {
                 fatal("Invalid {s}: {s}", .{ field_name, value_str });
             };
             if (is_percent) {
-                result.cpu_percent = val;
+                parser.result.cpu_percent = val;
             } else {
-                result.cpu_max = val;
+                parser.result.cpu_max = val;
             }
         } else if (std.mem.eql(u8, arg, "--experimental")) {
-            result.experimental = true;
+            parser.result.experimental = true;
         } else if (std.mem.eql(u8, arg, "--development")) {
-            result.development = true;
+            parser.result.development = true;
         } else if (std.mem.eql(u8, arg, "--log-debug")) {
-            result.log_debug = true;
+            parser.result.log_debug = true;
         } else if (!std.mem.startsWith(u8, arg, "--")) {
-            result.positional.path = arg;
+            parser.result.positional.path = arg;
         }
     }
 
-    if (result.service.len == 0) {
+    if (parser.result.service.len == 0) {
         fatal("--service is required", .{});
     }
-    if (result.pid_addresses.len == 0) {
+    if (parser.result.pid_addresses.len == 0) {
         fatal("--nodes (or --pid-addresses) is required", .{});
     }
-    if (result.positional.path.len == 0) {
+    if (parser.result.positional.path.len == 0) {
         fatal("Missing required data file path", .{});
     }
 
-    return result;
+    return parser.result;
 }
 
 fn parse_version_args(args_iterator: anytype) CLIArgs.Version {
-    var result = CLIArgs.Version{};
+    var parser = GenericArgParser(CLIArgs.Version).init();
 
     while (args_iterator.next()) |arg| {
         if (std.mem.eql(u8, arg, "--verbose")) {
-            result.verbose = true;
+            parser.result.verbose = true;
         }
     }
 
-    return result;
+    return parser.result;
 }
 
 fn parse_benchmark_args(args_iterator: anytype) CLIArgs.Benchmark {
-    var result = CLIArgs.Benchmark{};
+    var parser = GenericArgParser(CLIArgs.Benchmark).init();
 
     while (args_iterator.next()) |arg| {
-        if (std.mem.startsWith(u8, arg, "--target=")) {
-            result.target = arg["--target=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--duration=")) {
-            const value_str = arg["--duration=".len..];
-            result.duration = std.fmt.parseInt(u32, value_str, 10) catch {
-                fatal("Invalid duration: {s}", .{value_str});
-            };
-        } else if (std.mem.startsWith(u8, arg, "--connections=")) {
-            const value_str = arg["--connections=".len..];
-            result.connections = std.fmt.parseInt(u32, value_str, 10) catch {
-                fatal("Invalid connections: {s}", .{value_str});
-            };
-        } else if (std.mem.eql(u8, arg, "--validate")) {
-            result.validate = true;
-        } else if (std.mem.startsWith(u8, arg, "--addresses=")) {
-            result.addresses = arg["--addresses=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--seed=")) {
-            result.seed = arg["--seed=".len..];
+        if (parser.parseFlag(arg, "--target=", "target")) continue;
+        if (parser.parseFlag(arg, "--duration=", "duration")) continue;
+        if (parser.parseFlag(arg, "--connections=", "connections")) continue;
+        if (parser.parseFlag(arg, "--addresses=", "addresses")) continue;
+        if (parser.parseFlag(arg, "--seed=", "seed")) continue;
+
+        if (std.mem.eql(u8, arg, "--validate")) {
+            parser.result.validate = true;
         } else if (std.mem.eql(u8, arg, "--logger-debugger")) {
-            result.logger_debugger = true;
+            parser.result.logger_debugger = true;
         } else if (std.mem.eql(u8, arg, "--log-debug")) {
-            result.log_debug = true;
+            parser.result.log_debug = true;
         }
     }
 
-    return result;
+    return parser.result;
 }
-
-// Deploy merged into Start - no longer needed
-// fn parse_args_deploy(deploy: CLIArgs.Deploy) Command.Deploy { ... }
 
 fn parse_args_status(status: CLIArgs.Status) Command.Status {
     return .{
@@ -578,78 +601,8 @@ fn parse_args_wal(wal: CLIArgs.WAL) Command.WAL {
     };
 }
 
-// Format removed - no longer needed for orchestrator
-// fn parse_args_format(format: CLIArgs.Format) Command.Format {
-//     if (format.replica_count == 0) {
-//         fatal("--replica-count: value needs to be greater than zero", .{});
-//     }
-//     if (format.replica_count > 5) { // Old code - will be removed
-//         fatal("--replica-count: value is too large ({}), at most {} is allowed", .{
-//             format.replica_count,
-//             5,
-//         });
-//     }
-//
-//     if (format.replica == null and format.standby == null) {
-//         fatal("--replica: argument is required", .{});
-//     }
-//
-//     if (format.replica != null and format.standby != null) {
-//         fatal("--standby: conflicts with '--replica'", .{});
-//     }
-//
-//     if (format.replica) |replica| {
-//         if (replica >= format.replica_count) {
-//             fatal("--replica: value is too large ({}), at most {} is allowed", .{
-//                 replica,
-//                 format.replica_count - 1,
-//             });
-//         }
-//     }
-//
-//     if (format.standby) |standby| {
-//         if (standby < format.replica_count) {
-//             fatal("--standby: value is too small ({}), at least {} is required", .{
-//                 standby,
-//                 format.replica_count,
-//             });
-//         }
-//         if (standby >= format.replica_count + 3) { // Old code
-//             fatal("--standby: value is too large ({}), at most {} is allowed", .{
-//                 standby,
-//                 format.replica_count + 3 - 1,
-//             });
-//         }
-//     }
-//
-//     const replica = (format.replica orelse format.standby).?;
-//     assert(replica < 7);
-//     assert(replica < format.replica_count + 3);
-//
-//     const cluster_random = std.crypto.random.int(u128);
-//     assert(cluster_random != 0);
-//     const cluster = format.cluster orelse cluster_random;
-//     if (format.cluster == null) {
-//         std.log.info("generated random cluster id: {}\n", .{cluster});
-//     } else if (format.cluster.? == 0) {
-//         std.log.warn("a cluster id of 0 is reserved for testing and benchmarking, " ++
-//             "do not use in production", .{});
-//         std.log.warn("omit --cluster=0 to randomly generate a suitable id\n", .{});
-//     }
-//
-//     return .{
-//         .cluster = cluster,
-//         .replica = replica,
-//         .replica_count = format.replica_count,
-//         .development = format.development,
-//         .path = format.positional.path,
-//         .log_debug = format.log_debug,
-//     };
-// }
-
-fn parse_args_start(start: CLIArgs.Start) Command.Start {
-    // Allowlist of stable flags. --development will disable automatic multiversion
-    // upgrades too, but the flag itself is stable.
+// Validate experimental flags using comptime
+fn validateExperimentalFlags(start: CLIArgs.Start) void {
     const stable_args = .{
         "service",      "pid_addresses",
         "address",      "cache_size",
@@ -657,6 +610,7 @@ fn parse_args_start(start: CLIArgs.Start) Command.Start {
         "positional",   "development",
         "experimental",
     };
+
     inline for (std.meta.fields(@TypeOf(start))) |field| {
         @setEvalBranchQuota(10_000);
         const stable_field = comptime for (stable_args) |stable_arg| {
@@ -665,6 +619,7 @@ fn parse_args_start(start: CLIArgs.Start) Command.Start {
                 break true;
             }
         } else false;
+
         if (stable_field) continue;
 
         const flag_name = comptime blk: {
@@ -673,80 +628,60 @@ fn parse_args_start(start: CLIArgs.Start) Command.Start {
             break :blk result;
         };
 
-        // Validate at compile time that experimental fields have proper defaults
-        comptime {
-            // For experimental fields, ensure they default to null or false
-            const TypeInfo = @typeInfo(field.type);
-            const is_optional = TypeInfo == .optional;
-            const is_bool = field.type == bool;
-
-            if (!is_bool and !is_optional) {
-                @compileError("Experimental field '" ++ field.name ++ "' must be optional or bool");
-            }
-        }
-
         // Runtime check: if experimental field is set, require --experimental flag
         if (field.type == bool) {
             if (@field(start, field.name) and !start.experimental) {
-                fatal(
-                    "{s} is marked experimental, add `--experimental` to continue.",
-                    .{flag_name},
-                );
+                fatal("{s} is marked experimental, add `--experimental` to continue.", .{flag_name});
             }
-        } else {
+        } else if (@typeInfo(field.type) == .optional) {
             if (@field(start, field.name) != null and !start.experimental) {
-                fatal(
-                    "{s} is marked experimental, add `--experimental` to continue.",
-                    .{flag_name},
-                );
+                fatal("{s} is marked experimental, add `--experimental` to continue.", .{flag_name});
             }
         }
     }
+}
+
+fn parse_args_start(start: CLIArgs.Start) Command.Start {
+    validateExperimentalFlags(start);
 
     const addresses = parse_addresses(start.pid_addresses, "--pid-addresses");
 
-    const storage_size_limit = if (start.limit_storage) |ls|
-        ls.bytes()
-    else
-        10 * GIB;
+    // Use generic validators for limits
+    const storage_limit = validate_range(
+        start.limit_storage orelse ByteSize{ .value = 10 * GIB },
+        .{
+            .flag = "--limit-storage",
+            .min = 64 * MIB,
+            .max = 1024 * GIB,
+            .alignment = 512,
+        },
+    );
 
-    if (storage_size_limit > 1024 * GIB) {
-        fatal("--limit-storage: size exceeds maximum: {}", .{1024 * GIB});
-    }
-    if (storage_size_limit < 64 * MIB) {
-        fatal("--limit-storage: size is below minimum: {}", .{64 * MIB});
-    }
-    if (storage_size_limit % 512 != 0) {
-        fatal("--limit-storage: size must be a multiple of sector size ({})", .{512});
-    }
+    const pipeline_limit = validate_range(
+        start.limit_pipeline_requests orelse @as(u32, 100),
+        .{
+            .flag = "--limit-pipeline-requests",
+            .min = 0,
+            .max = 1024,
+        },
+    );
 
-    const pipeline_limit = start.limit_pipeline_requests orelse 100;
-    if (pipeline_limit > 1024) {
-        fatal("--limit-pipeline-requests: count {} exceeds maximum: {}", .{
-            pipeline_limit,
-            1024,
-        });
-    }
+    const request_limit = validate_range(
+        if (start.limit_request) |rl| @as(u32, @intCast(rl.bytes())) else @as(u32, 1 * MIB),
+        .{
+            .flag = "--limit-request",
+            .min = 4096,
+            .max = 1 * MIB,
+        },
+    );
 
-    const request_limit = if (start.limit_request) |rl|
-        @as(u32, @intCast(rl.bytes()))
-    else
-        @as(u32, 1 * MIB);
+    // Validate percentages
+    const mem_percent = validate_percentage(start.mem_percent, "--mem-percent");
+    const cpu_percent = validate_percentage(start.cpu_percent, "--cpu-percent");
 
-    if (request_limit > 1 * MIB) {
-        fatal("--limit-request: size exceeds maximum: {}", .{1 * MIB});
-    }
-    if (request_limit < 4096) {
-        fatal("--limit-request: size is below minimum: 4096", .{});
-    }
-
-    // Validate mem and cpu percentages
-    if (start.mem_percent == 0 or start.mem_percent > 100) {
-        fatal("--mem-percent must be between 1 and 100", .{});
-    }
-    if (start.cpu_percent == 0 or start.cpu_percent > 100) {
-        fatal("--cpu-percent must be between 1 and 100", .{});
-    }
+    _ = storage_limit;
+    _ = pipeline_limit;
+    _ = request_limit;
 
     const parsed_address = if (start.address) |addr|
         parse_address_and_port(addr, "--address", orchestrator_port)
@@ -757,8 +692,8 @@ fn parse_args_start(start: CLIArgs.Start) Command.Start {
         .service = start.service,
         .nodes = addresses,
         .bind = parsed_address,
-        .mem_percent = start.mem_percent,
-        .cpu_percent = start.cpu_percent,
+        .mem_percent = mem_percent,
+        .cpu_percent = cpu_percent,
         .state_dir = start.positional.path,
         .development = start.development,
         .log_debug = start.log_debug,
@@ -789,7 +724,6 @@ fn parse_args_benchmark(benchmark: CLIArgs.Benchmark) Command.Benchmark {
         .log_debug = benchmark.log_debug,
     };
 }
-
 
 fn parse_addresses(raw_addresses: []const u8, comptime flag: []const u8) Command.Addresses {
     comptime assert(std.mem.startsWith(u8, flag, "--"));
