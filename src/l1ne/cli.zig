@@ -153,16 +153,16 @@ const CLIArgs = union(enum) {
         \\
         \\Usage:
         \\  l1ne [-h | --help]
-        \\  l1ne start --service=<name> --nodes=<addr:port,...> <path> [--development] [--log-debug]
-        \\  l1ne status --service=<name> [--node=<addr:port>] [--format=<json|text>]
-        \\  l1ne wal <path> [--node=<addr:port>] [--lines=N] [--follow]
+        \\  l1ne start --service=<name> --nodes=<addr:port,...> <path> [options]
+        \\  l1ne status [--node=<addr:port>]
+        \\  l1ne wal <path> [--node=<addr:port>] [--slot=N] [--lines=N] [--follow]
         \\  l1ne version [--verbose]
-        \\  l1ne benchmark [--target=<url>] [--duration=<seconds>] [--connections=N]
+        \\  l1ne benchmark [options]
         \\
         \\Commands:
         \\
         \\  start      Deploy service instances to specified network addresses
-        \\  status     Show status of service instances
+        \\  status     Show status of service instances (limited implementation)
         \\  wal        View centralized Write-Ahead Log from instances
         \\  version    Print the L1NE version
         \\  benchmark  Run performance benchmarks
@@ -171,53 +171,57 @@ const CLIArgs = union(enum) {
         \\  l1ne start --service=api --nodes=127.0.0.1:8080,127.0.0.1:8081 /tmp/state
         \\    Deploy 2 instances on ports 8080 and 8081
         \\
-        \\  l1ne status --service=api --format=json
-        \\    Show status of api service instances in JSON format
+        \\  l1ne status --node=127.0.0.1:8080
+        \\    Show status of a specific node
         \\
         \\  l1ne wal /tmp/state --lines=100 --follow
         \\    Tail the last 100 lines of the WAL and follow for new entries
         \\
-        \\Options:
+        \\  l1ne benchmark --target=http://localhost:8080 --duration=60
+        \\    Run a benchmark for 60 seconds against the target
         \\
-        \\  -h, --help
-        \\        Print this help message and exit.
+        \\Start Options:
         \\
-        \\  --service=<name>
-        \\        Name of the service to deploy or query.
+        \\  --service=<name>       Required. Name of the service to deploy
+        \\  --nodes=<addresses>    Required. Comma-separated list of IP:port pairs
+        \\  --address=<bind>       Bind address for control plane (default: 0.0.0.0)
+        \\  --mem-percent=<1-100>  Memory limit as percentage of FAAS limit (default: 50)
+        \\  --cpu-percent=<1-100>  CPU limit as percentage of FAAS limit (default: 50)
+        \\  --cache-size=<size>    Cache size (e.g., 100MiB, 1GiB)
+        \\  --development          Enable development mode
+        \\  --log-debug            Enable debug logging
+        \\  --experimental         Enable experimental features
+        \\  --sre                  Enable SRE mode
         \\
-        \\  --nodes=<addresses>
-        \\        Comma-separated list of IP:port pairs for service instances.
-        \\        Example: 127.0.0.1:8080,127.0.0.1:8081
+        \\Status Options:
         \\
-        \\  --node=<address>
-        \\        Specific node address to query (for status/wal commands).
+        \\  --node=<address>       Specific node address to query
         \\
-        \\  --format=<json|text>
-        \\        Output format for status command (default: text).
+        \\WAL Options:
         \\
-        \\  --lines=<number>
-        \\        Number of lines to display from WAL (default: 100).
+        \\  --node=<address>       Filter by specific node
+        \\  --slot=<number>        Specific log entry slot
+        \\  --lines=<number>       Number of lines to display (default: 100)
+        \\  --follow, -f           Continuously monitor for new entries
         \\
-        \\  --follow
-        \\        Continuously monitor WAL for new entries.
+        \\Version Options:
         \\
-        \\  --development
-        \\        Enable development mode (relaxed safety checks).
+        \\  --verbose              Print detailed version information
         \\
-        \\  --log-debug
-        \\        Enable debug logging.
+        \\Benchmark Options:
         \\
-        \\  --verbose
-        \\        Print detailed version information.
+        \\  --target=<url>         Target URL for benchmark
+        \\  --duration=<seconds>   Duration in seconds (default: 60)
+        \\  --connections=<N>      Number of concurrent connections (default: 100)
+        \\  --addresses=<addrs>    Comma-separated addresses
+        \\  --seed=<value>         Random seed for reproducible tests
+        \\  --validate             Enable validation mode
+        \\  --logger-debugger      Enable logger debugger
+        \\  --log-debug            Enable debug logging
         \\
-        \\  --target=<url>
-        \\        Target URL for benchmark.
+        \\General Options:
         \\
-        \\  --duration=<seconds>
-        \\        Duration of benchmark in seconds.
-        \\
-        \\  --connections=<number>
-        \\        Number of concurrent connections for benchmark.
+        \\  -h, --help             Print this help message and exit
         \\
     ;
 };

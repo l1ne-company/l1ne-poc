@@ -5,9 +5,11 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    
+
     const command = cli.parse_args(allocator);
-    
+
+    // initialize things hehe
+
     switch (command) {
         .start => |start| {
             std.debug.print("Starting L1NE POC - deploying service instances...\n", .{});
@@ -17,9 +19,7 @@ pub fn main() !void {
                 // Simple format for IPv4 addresses
                 const bytes = @as(*const [4]u8, @ptrCast(&node.in.sa.addr));
                 const port = std.mem.bigToNative(u16, node.in.sa.port);
-                std.debug.print("    Instance {}: {}.{}.{}.{}:{}\n", .{ 
-                    i + 1, bytes[0], bytes[1], bytes[2], bytes[3], port
-                });
+                std.debug.print("    Instance {}: {}.{}.{}.{}:{}\n", .{ i + 1, bytes[0], bytes[1], bytes[2], bytes[3], port });
             }
             std.debug.print("  State Dir: {s}\n", .{start.state_dir});
             if (start.log_debug) {
