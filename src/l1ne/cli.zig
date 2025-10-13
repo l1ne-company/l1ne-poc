@@ -73,6 +73,9 @@ const CLIArgs = union(enum) {
         // Required: service configuration
         service: []const u8,
 
+        // Binary path and arguments to execute
+        exec: []const u8, // Path to the binary to run
+
         // Nodes to deploy to (comma-separated addresses)
         pid_addresses: []const u8,
 
@@ -153,7 +156,7 @@ const CLIArgs = union(enum) {
         \\
         \\Usage:
         \\  l1ne [-h | --help]
-        \\  l1ne start --service=<name> --nodes=<addr:port,...> <path> [options]
+        \\  l1ne start --service=<name> --exec=<binary> --nodes=<addr:port,...> <path> [options]
         \\  l1ne status [--node=<addr:port>]
         \\  l1ne wal <path> [--node=<addr:port>] [--slot=N] [--lines=N] [--follow]
         \\  l1ne version [--verbose]
@@ -168,8 +171,8 @@ const CLIArgs = union(enum) {
         \\  benchmark  Run performance benchmarks
         \\
         \\Examples:
-        \\  l1ne start --service=api --nodes=127.0.0.1:8080,127.0.0.1:8081 /tmp/state
-        \\    Deploy 2 instances on ports 8080 and 8081
+        \\  l1ne start --service=dumb-server --exec=./dumb-server/result/bin/dumb-server --nodes=8080,8081 /tmp/state
+        \\    Deploy 2 dumb-server instances on ports 8080 and 8081
         \\
         \\  l1ne status --node=127.0.0.1:8080
         \\    Show status of a specific node
@@ -183,6 +186,7 @@ const CLIArgs = union(enum) {
         \\Start Options:
         \\
         \\  --service=<name>       Required. Name of the service to deploy
+        \\  --exec=<binary>        Required. Path to the binary to execute
         \\  --nodes=<addresses>    Required. Comma-separated list of IP:port pairs
         \\  --address=<bind>       Bind address for control plane (default: 0.0.0.0)
         \\  --mem-percent=<1-100>  Memory limit as percentage of FAAS limit (default: 50)
@@ -249,6 +253,7 @@ pub const Command = union(enum) {
 
     pub const Start = struct {
         service: []const u8, // Service name to deploy
+        exec_path: []const u8, // Binary path to execute
         nodes: Addresses, // Nodes to deploy to (one service per node)
         bind: std.net.Address, // Control plane bind address
         mem_percent: u8, // FAAS memory percentage
@@ -482,6 +487,7 @@ fn parse_start_args(args_iterator: anytype) CLIArgs.Start {
     while (args_iterator.next()) |arg| {
         // Use comptime-generated parsing for common patterns
         if (parser.parseFlag(arg, "--service=", "service")) continue;
+        if (parser.parseFlag(arg, "--exec=", "exec")) continue;
         if (parser.parseFlag(arg, "--cache-size=", "cache_size")) continue;
         if (parser.parseFlag(arg, "--limit-storage=", "limit_storage")) continue;
         if (parser.parseFlag(arg, "--limit-request=", "limit_request")) continue;
@@ -542,6 +548,9 @@ fn parse_start_args(args_iterator: anytype) CLIArgs.Start {
 
     if (parser.result.service.len == 0) {
         fatal("--service is required", .{});
+    }
+    if (parser.result.exec.len == 0) {
+        fatal("--exec is required", .{});
     }
     if (parser.result.pid_addresses.len == 0) {
         fatal("--nodes (or --pid-addresses) is required", .{});
@@ -694,6 +703,7 @@ fn parse_args_start(start: CLIArgs.Start) Command.Start {
 
     return .{
         .service = start.service,
+        .exec_path = start.exec,
         .nodes = addresses,
         .bind = parsed_address,
         .mem_percent = mem_percent,

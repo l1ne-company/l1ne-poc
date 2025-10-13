@@ -4,7 +4,7 @@
 //! - Service state management
 //! - Resource monitoring via cgroups
 //! - Journal integration
-//! - D-bus integration
+//! - for prod needs D-bus integration (no systemclt)
 
 const std = @import("std");
 const posix = std.posix;
@@ -248,10 +248,9 @@ pub const ServiceManager = struct {
         defer args.deinit(self.allocator);
 
         try args.append(self.allocator, "systemd-run");
-        try args.append(self.allocator, "--uid");
-        try args.append(self.allocator, try fmt.allocPrint(self.allocator, "{d}", .{config.uid}));
-        try args.append(self.allocator, "--gid");
-        try args.append(self.allocator, try fmt.allocPrint(self.allocator, "{d}", .{config.gid}));
+        try args.append(self.allocator, "--user"); // Run as user service
+        try args.append(self.allocator, "--collect"); // Clean up after service stops
+        // Note: --uid and --gid are not supported for --user services
 
         if (config.memory_max) |memory| {
             try args.append(self.allocator, "--property");
@@ -265,13 +264,30 @@ pub const ServiceManager = struct {
 
         try args.append(self.allocator, "--unit");
         try args.append(self.allocator, config.unit_name);
+
+        // Add environment variables if provided
+        if (config.environment) |env_map| {
+            var iter = env_map.iterator();
+            while (iter.next()) |entry| {
+                const env_str = try fmt.allocPrint(self.allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+                try args.append(self.allocator, "--setenv");
+                try args.append(self.allocator, env_str);
+            }
+        }
+
         try args.append(self.allocator, "--");
         try args.appendSlice(self.allocator, config.exec_args);
+
+        // Debug: print the command
+        std.log.debug("systemd-run command:", .{});
+        for (args.items) |arg| {
+            std.log.debug("  {s}", .{arg});
+        }
 
         // Use std.process.Child for now until we implement D-Bus
         var child = std.process.Child.init(args.items, self.allocator);
         child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
+        child.stdout_behavior = .Inherit;
         child.stderr_behavior = .Inherit;
 
         try child.spawn();
@@ -286,7 +302,7 @@ pub const ServiceManager = struct {
         memory_max: ?usize = null,
         cpu_quota: ?u8 = null,
         working_directory: ?[]const u8 = null,
-        environment: ?std.process.EnvMap = null,
+        environment: ?std.StringHashMap([]const u8) = null,
     };
 };
 
@@ -393,6 +409,141 @@ pub fn getInvocationId(allocator: mem.Allocator) !?[]const u8 {
     return std.process.getEnvVarOwned(allocator, "INVOCATION_ID") catch null;
 }
 
+// ============================================================================
+// SYSTEMCTL STATUS QUERIES
+// ============================================================================
+
+/// Service status information retrieved from systemd
+pub const ServiceStatus = struct {
+    active_state: []const u8, // "active", "inactive", "failed", etc.
+    sub_state: []const u8, // "running", "dead", "exited", etc.
+    main_pid: ?posix.pid_t,
+    memory_current: ?u64, // Bytes
+    cpu_usage_nsec: ?u64, // Nanoseconds
+    load_state: []const u8, // "loaded", "not-found", etc.
+    description: []const u8,
+
+    pub fn deinit(self: *ServiceStatus, allocator: mem.Allocator) void {
+        allocator.free(self.active_state);
+        allocator.free(self.sub_state);
+        allocator.free(self.load_state);
+        allocator.free(self.description);
+    }
+};
+
+/// Query systemctl for service status using `systemctl show`
+pub fn queryServiceStatus(allocator: mem.Allocator, unit_name: []const u8, user_mode: bool) !ServiceStatus {
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, "systemctl");
+    if (user_mode) try argv.append(allocator, "--user");
+    try argv.append(allocator, "show");
+    try argv.append(allocator, unit_name);
+    try argv.append(allocator, "--property=ActiveState,SubState,MainPID,MemoryCurrent,CPUUsageNSec,LoadState,Description");
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv.items,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.term != .Exited or result.term.Exited != 0) {
+        return error.SystemctlFailed;
+    }
+
+    return parseSystemctlShow(allocator, result.stdout);
+}
+
+/// Parse output from `systemctl show`
+fn parseSystemctlShow(allocator: mem.Allocator, output: []const u8) !ServiceStatus {
+    var status = ServiceStatus{
+        .active_state = "",
+        .sub_state = "",
+        .main_pid = null,
+        .memory_current = null,
+        .cpu_usage_nsec = null,
+        .load_state = "",
+        .description = "",
+    };
+
+    var lines = mem.tokenizeScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        var parts = mem.splitScalar(u8, line, '=');
+        const key = parts.next() orelse continue;
+        const value = parts.next() orelse "";
+
+        if (mem.eql(u8, key, "ActiveState")) {
+            status.active_state = try allocator.dupe(u8, value);
+        } else if (mem.eql(u8, key, "SubState")) {
+            status.sub_state = try allocator.dupe(u8, value);
+        } else if (mem.eql(u8, key, "MainPID")) {
+            status.main_pid = if (value.len > 0 and !mem.eql(u8, value, "0"))
+                fmt.parseInt(posix.pid_t, value, 10) catch null
+            else
+                null;
+        } else if (mem.eql(u8, key, "MemoryCurrent")) {
+            status.memory_current = if (value.len > 0 and !mem.eql(u8, value, "[not set]"))
+                fmt.parseInt(u64, value, 10) catch null
+            else
+                null;
+        } else if (mem.eql(u8, key, "CPUUsageNSec")) {
+            status.cpu_usage_nsec = if (value.len > 0 and !mem.eql(u8, value, "[not set]"))
+                fmt.parseInt(u64, value, 10) catch null
+            else
+                null;
+        } else if (mem.eql(u8, key, "LoadState")) {
+            status.load_state = try allocator.dupe(u8, value);
+        } else if (mem.eql(u8, key, "Description")) {
+            status.description = try allocator.dupe(u8, value);
+        }
+    }
+
+    return status;
+}
+
+/// List all L1NE-managed services
+pub fn listL1neServices(allocator: mem.Allocator, user_mode: bool) ![][]const u8 {
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, "systemctl");
+    if (user_mode) try argv.append(allocator, "--user");
+    try argv.append(allocator, "list-units");
+    try argv.append(allocator, "--no-pager");
+    try argv.append(allocator, "--plain");
+    try argv.append(allocator, "--no-legend");
+    try argv.append(allocator, "l1ne-*.service");
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv.items,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    var services = std.ArrayList([]const u8).empty;
+
+    if (result.term != .Exited or result.term.Exited != 0) {
+        // No services found is not an error
+        return try services.toOwnedSlice(allocator);
+    }
+
+    var lines = mem.tokenizeScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        // Parse line: "unit.service loaded active running Description"
+        var parts = mem.tokenizeScalar(u8, line, ' ');
+        const unit_name = parts.next() orelse continue;
+
+        if (mem.endsWith(u8, unit_name, ".service")) {
+            try services.append(allocator, try allocator.dupe(u8, unit_name));
+        }
+    }
+
+    return try services.toOwnedSlice(allocator);
+}
+
 test "systemd notifier basic" {
     var notifier = Notifier.init(std.testing.allocator);
     defer notifier.deinit();
@@ -424,26 +575,26 @@ test "is under systemd" {
 /// Demonstrates what each systemd feature does
 pub fn demonstrateFeatures(allocator: mem.Allocator) !void {
     std.debug.print("\n=== L1NE systemd Integration Features ===\n\n", .{});
-    
+
     // 1. Detection
     std.debug.print("1. DETECTION: Running under systemd? {}\n", .{isUnderSystemd()});
-    
+
     // 2. Notifications - what they do
     std.debug.print("\n2. NOTIFICATIONS (What they do):\n", .{});
     std.debug.print("   • READY=1: Tells systemd service is ready\n", .{});
     std.debug.print("   • STATUS=...: Updates shown in 'systemctl status'\n", .{});
     std.debug.print("   • WATCHDOG=1: Prevents systemd from killing service\n", .{});
     std.debug.print("   • STOPPING=1: Graceful shutdown notification\n", .{});
-    
+
     var notifier = Notifier.init(allocator);
     defer notifier.deinit();
-    
+
     if (notifier.socket_path) |path| {
         std.debug.print("   Socket path: {s}\n", .{path});
     } else {
         std.debug.print("   Not under systemd - notifications disabled\n", .{});
     }
-    
+
     // 3. Socket activation - what it does
     std.debug.print("\n3. SOCKET ACTIVATION (Zero-downtime restarts):\n", .{});
     const fds = try SocketActivation.getListenFds(allocator);
@@ -452,13 +603,13 @@ pub fn demonstrateFeatures(allocator: mem.Allocator) !void {
     if (fds.len > 0) {
         std.debug.print("   Service can restart without dropping connections\n", .{});
     }
-    
+
     // 4. Resource limits - what they control
     std.debug.print("\n4. RESOURCE LIMITS (What they control):\n", .{});
     std.debug.print("   • MemoryMax: Hard memory limit (OOM killer)\n", .{});
     std.debug.print("   • CPUQuota: CPU time percentage\n", .{});
     std.debug.print("   • Monitored via /sys/fs/cgroup/\n", .{});
-    
+
     // Show example conversion
     const example_mem: u8 = 75;
     const example_cpu: u8 = 50;
@@ -467,7 +618,7 @@ pub fn demonstrateFeatures(allocator: mem.Allocator) !void {
         @as(usize, 50) * @as(usize, example_mem) / 100, // Base 50MB
         @as(usize, 10) * @as(usize, example_cpu) / 100, // Base 10%
     });
-    
+
     // 5. How to test it
     std.debug.print("\n5. HOW TO TEST:\n", .{});
     std.debug.print("   # Create test socket:\n", .{});
@@ -484,18 +635,18 @@ test "demonstrate features" {
 test "notification messages format" {
     var notifier = Notifier.init(std.testing.allocator);
     defer notifier.deinit();
-    
+
     // Test message formatting (won't actually send)
     var buf: [256]u8 = undefined;
-    
+
     // Status message
     const status_msg = try fmt.bufPrint(&buf, "STATUS={s}", .{"Service starting..."});
     try std.testing.expect(mem.eql(u8, status_msg, "STATUS=Service starting..."));
-    
+
     // PID message
     const pid_msg = try fmt.bufPrint(&buf, "MAINPID={d}", .{@as(posix.pid_t, 1234)});
     try std.testing.expect(mem.eql(u8, pid_msg, "MAINPID=1234"));
-    
+
     // Watchdog
     const wd_msg = "WATCHDOG=1";
     try std.testing.expect(mem.eql(u8, wd_msg, "WATCHDOG=1"));
@@ -504,12 +655,12 @@ test "notification messages format" {
 test "watchdog interval calculation" {
     var notifier = Notifier.init(std.testing.allocator);
     defer notifier.deinit();
-    
+
     const watchdog = try Watchdog.init(&notifier, std.testing.allocator);
-    
+
     // In test environment, no watchdog
     try std.testing.expect(watchdog.interval_usec == null);
-    
+
     // If we had watchdog set to 30 seconds
     // It would use half interval: 15 seconds
     const theoretical_interval: u64 = 30_000_000; // 30 seconds in microseconds
@@ -525,18 +676,18 @@ test "resource limit conversions" {
         expected_mem_mb: usize,
         expected_cpu: u8,
     };
-    
+
     const test_cases = [_]TestCase{
         .{ .mem_percent = 100, .cpu_percent = 100, .expected_mem_mb = 50, .expected_cpu = 10 },
         .{ .mem_percent = 50, .cpu_percent = 50, .expected_mem_mb = 25, .expected_cpu = 5 },
         .{ .mem_percent = 80, .cpu_percent = 20, .expected_mem_mb = 40, .expected_cpu = 2 },
         .{ .mem_percent = 10, .cpu_percent = 10, .expected_mem_mb = 5, .expected_cpu = 1 },
     };
-    
+
     for (test_cases) |tc| {
         const memory_max: usize = @as(usize, 50 * 1024 * 1024) * @as(usize, tc.mem_percent) / 100;
         const cpu_quota = @as(usize, 10) * @as(usize, tc.cpu_percent) / 100;
-        
+
         try std.testing.expectEqual(tc.expected_mem_mb * 1024 * 1024, memory_max);
         try std.testing.expectEqual(@as(usize, tc.expected_cpu), cpu_quota);
     }
@@ -548,18 +699,14 @@ test "cgroup paths" {
         "l1ne-api-8080",
         "test-service",
     };
-    
+
     for (test_services) |service| {
         var monitor = try CgroupMonitor.init(std.testing.allocator, service);
         defer monitor.deinit();
-        
-        const expected = try fmt.allocPrint(
-            std.testing.allocator,
-            "/sys/fs/cgroup/system.slice/{s}.service",
-            .{service}
-        );
+
+        const expected = try fmt.allocPrint(std.testing.allocator, "/sys/fs/cgroup/system.slice/{s}.service", .{service});
         defer std.testing.allocator.free(expected);
-        
+
         try std.testing.expectEqualStrings(expected, monitor.cgroup_path);
     }
 }
@@ -568,39 +715,36 @@ test "socket activation FD numbering" {
     // systemd passes FDs starting at 3
     // stdin=0, stdout=1, stderr=2, then service sockets
     const SD_LISTEN_FDS_START = 3;
-    
+
     // If systemd passed 3 sockets, they would be:
     const mock_fds = [_]posix.fd_t{ 3, 4, 5 };
-    
+
     for (mock_fds, 0..) |fd, i| {
-        try std.testing.expectEqual(
-            @as(posix.fd_t, @intCast(SD_LISTEN_FDS_START + i)),
-            fd
-        );
+        try std.testing.expectEqual(@as(posix.fd_t, @intCast(SD_LISTEN_FDS_START + i)), fd);
     }
 }
 
 test "multiple notifications batching" {
     var notifier = Notifier.init(std.testing.allocator);
     defer notifier.deinit();
-    
+
     // Test batching multiple notifications
     const messages = [_][]const u8{
         "READY=1",
         "STATUS=Service initialized",
         "MAINPID=12345",
     };
-    
+
     // Would be sent as single message with newlines
     var expected_buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&expected_buf);
     const writer = fbs.writer();
-    
+
     for (messages, 0..) |msg, i| {
         if (i > 0) try writer.writeByte('\n');
         try writer.writeAll(msg);
     }
-    
+
     const expected = fbs.getWritten();
     try std.testing.expect(mem.eql(u8, expected, "READY=1\nSTATUS=Service initialized\nMAINPID=12345"));
 }
@@ -614,7 +758,7 @@ test "transient service config" {
         .memory_max = 52428800, // 50MB
         .cpu_quota = 10,
     };
-    
+
     try std.testing.expectEqualStrings("test-service", config.unit_name);
     try std.testing.expectEqual(@as(usize, 52428800), config.memory_max.?);
     try std.testing.expectEqual(@as(u8, 10), config.cpu_quota.?);
@@ -627,14 +771,14 @@ test "live notification test (requires NOTIFY_SOCKET)" {
         std.debug.print("To run: NOTIFY_SOCKET=/tmp/test.sock zig test src/l1ne/systemd.zig\n", .{});
         return;
     }
-    
+
     var notifier = Notifier.init(std.testing.allocator);
     defer notifier.deinit();
-    
+
     // These would actually send to systemd
     try notifier.ready();
     try notifier.status("Running tests");
     try notifier.watchdog();
-    
+
     std.debug.print("Successfully sent notifications to systemd!\n", .{});
 }
